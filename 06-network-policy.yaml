@@ -1,0 +1,63 @@
+# NetworkPolicy for VictoriaLogs
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: victoria-logs-netpol
+  namespace: kube-logging
+spec:
+  podSelector:
+    matchLabels:
+      app: victoria-logs
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: kube-logging
+    - podSelector:
+        matchLabels:
+          app: fluentd
+    ports:
+    - port: 9428
+      protocol: TCP
+    - port: 9429
+      protocol: TCP
+  egress:
+  - to:
+    - podSelector: {}
+    ports:
+    - port: 53
+      protocol: TCP
+    - port: 53
+      protocol: UDP
+
+---
+# NetworkPolicy for Fluentd
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fluentd-netpol
+  namespace: kube-logging
+spec:
+  podSelector:
+    matchLabels:
+      app: fluentd
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector: {}
+    ports:
+    - port: 24231
+      protocol: TCP
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: kube-logging
+    ports:
+    - port: 9429
+      protocol: TCP

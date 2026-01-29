@@ -1,0 +1,233 @@
+# VictoriaLogs StatefulSet
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: victoria-logs
+  namespace: kube-logging
+  labels:
+    app: victoria-logs
+    component: log-storage
+spec:
+  serviceName: victoria-logs
+  replicas: 1
+  selector:
+    matchLabels:
+      app: victoria-logs
+  template:
+    metadata:
+      labels:
+        app: victoria-logs
+        component: log-storage
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9428"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: victoria-logs
+      securityContext:
+        fsGroup: 1000
+        runAsUser: 1000
+        runAsGroup: 1000
+      containers:
+      - name: victoria-logs
+        image: victoriametrics/victoria-logs:latest
+        imagePullPolicy: IfNotPresent
+        args:
+          - "--storageDataPath=/storage"
+          - "--retentionPeriod=30d"
+          - "--retention.maxDiskSpaceUsageBytes=100GB"
+          - "--insert.maxRequestSize=64MB"
+          - "--search.maxQueryDuration=30s"
+          - "--search.maxExportDuration=5m"
+          - "--search.maxUniqueTimeseries=200000"
+          - "--search.maxMemoryBytes=2147483648"
+          - "--memory.allowedPercent=70"
+          - "--loggerFormat=json"
+          - "--envflag.enable=true"
+          - "--envflag.prefix=VL_"
+        env:
+        - name: VL_GOMAXPROCS
+          value: "2"
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        ports:
+        - name: http
+          containerPort: 9428
+          protocol: TCP
+        - name: ingest
+          containerPort: 9429
+          protocol: TCP
+        - name: syslog
+          containerPort: 9430
+          protocol: TCP
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: http
+            scheme: HTTP
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 1
+        resources:
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+        volumeMounts:
+        - name: storage
+          mountPath: /storage
+        - name: config
+          mountPath: /etc/victoria-logs
+          readOnly: true
+      volumes:
+      - name: config
+        configMap:
+          name: victoria-logs-config
+          optional: true  # Config is optional, mostly configured via args
+  volumeClaimTemplates:
+  - metadata:
+      name: storage
+    spec:
+      accessModes:
+        - ReadWriteOnce
+      storageClassName: managed-nfs-storage
+      resources:
+        requests:
+          storage: 100Gi
+
+---
+# VictoriaLogs ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: victoria-logs-config
+  namespace: kube-logging
+data:
+  config.yaml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+    
+    scrape_configs:
+      - job_name: 'victoria-logs-self'
+        static_configs:
+          - targets: ['localhost:9428']
+    
+    remote_write:
+      - url: http://victoria-logs:8428/api/v1/write
+
+---
+# VictoriaLogs ServiceAccount
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: victoria-logs
+  namespace: kube-logging
+
+---
+# VictoriaLogs ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: victoria-logs
+rules:
+- apiGroups: [""]
+  resources:
+  - nodes
+  - nodes/proxy
+  - services
+  - endpoints
+  - pods
+  verbs: ["get", "list", "watch"]
+- apiGroups:
+  - extensions
+  resources:
+  - ingresses
+  verbs: ["get", "list", "watch"]
+
+---
+# VictoriaLogs ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: victoria-logs
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: victoria-logs
+subjects:
+- kind: ServiceAccount
+  name: victoria-logs
+  namespace: kube-logging
+
+---
+# VictoriaLogs Service (ClusterIP)
+apiVersion: v1
+kind: Service
+metadata:
+  name: victoria-logs
+  namespace: kube-logging
+  labels:
+    app: victoria-logs
+    component: log-storage
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 9428
+    targetPort: http
+    protocol: TCP
+  - name: ingest
+    port: 9429
+    targetPort: ingest
+    protocol: TCP
+  - name: syslog
+    port: 9430
+    targetPort: syslog
+    protocol: TCP
+  selector:
+    app: victoria-logs
+
+---
+# VictoriaLogs Service (NodePort for external access)
+apiVersion: v1
+kind: Service
+metadata:
+  name: victoria-logs-external
+  namespace: kube-logging
+  labels:
+    app: victoria-logs
+    component: log-storage
+spec:
+  type: NodePort
+  ports:
+  - name: http
+    port: 9428
+    targetPort: http
+    nodePort: 30428
+    protocol: TCP
+  - name: ingest
+    port: 9429
+    targetPort: ingest
+    nodePort: 30429
+    protocol: TCP
+  selector:
+    app: victoria-logs

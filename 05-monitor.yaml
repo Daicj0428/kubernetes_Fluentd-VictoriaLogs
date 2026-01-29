@@ -1,0 +1,148 @@
+# ServiceMonitor for VictoriaLogs
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: victoria-logs
+  namespace: kube-logging
+  labels:
+    app: victoria-logs
+    component: monitoring
+spec:
+  endpoints:
+  - port: http
+    interval: 15s
+    path: /metrics
+    honorLabels: true
+    scrapeTimeout: 10s
+    params:
+      format: [prometheus]
+  namespaceSelector:
+    matchNames:
+    - kube-logging
+  selector:
+    matchLabels:
+      app: victoria-logs
+
+---
+# ServiceMonitor for Fluentd
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: fluentd
+  namespace: kube-logging
+  labels:
+    app: fluentd
+    component: monitoring
+spec:
+  endpoints:
+  - port: metrics
+    interval: 15s
+    path: /metrics
+    honorLabels: true
+    scrapeTimeout: 10s
+  namespaceSelector:
+    matchNames:
+    - kube-logging
+  selector:
+    matchLabels:
+      app: fluentd
+
+---
+# PrometheusRule for VictoriaLogs alerts
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: victoria-logs-alerts
+  namespace: kube-logging
+  labels:
+    app: victoria-logs
+    component: monitoring
+    prometheus: kube-prometheus
+    role: alert-rules
+spec:
+  groups:
+  - name: victoria-logs.rules
+    interval: 30s
+    rules:
+    - alert: VictoriaLogsDown
+      expr: up{job="victoria-logs"} == 0
+      for: 2m
+      labels:
+        severity: critical
+        component: log-storage
+      annotations:
+        summary: "VictoriaLogs is down"
+        description: "VictoriaLogs instance {{ $labels.instance }} has been down for more than 2 minutes."
+        
+    - alert: VictoriaLogsHighIngestionRate
+      expr: rate(vl_ingested_rows_total[5m]) > 50000
+      for: 5m
+      labels:
+        severity: warning
+        component: log-storage
+      annotations:
+        summary: "High log ingestion rate"
+        description: "VictoriaLogs is ingesting {{ $value | humanize }} rows per second (threshold: 50k)"
+        
+    - alert: VictoriaLogsHighMemoryUsage
+      expr: (process_resident_memory_bytes{job="victoria-logs"} / node_memory_MemTotal_bytes) * 100 > 75
+      for: 10m
+      labels:
+        severity: warning
+        component: log-storage
+      annotations:
+        summary: "High memory usage"
+        description: "VictoriaLogs is using {{ $value | humanizePercentage }} of available memory"
+        
+    - alert: VictoriaLogsHighDiskUsage
+      expr: (vl_storage_size_bytes / vl_storage_max_disk_usage_bytes) * 100 > 80
+      for: 15m
+      labels:
+        severity: warning
+        component: log-storage
+      annotations:
+        summary: "High disk usage"
+        description: "VictoriaLogs disk usage is {{ $value | humanizePercentage }} of limit"
+        
+    - alert: VictoriaLogsIngestionErrors
+      expr: rate(vl_ingested_rows_errors_total[5m]) > 10
+      for: 5m
+      labels:
+        severity: warning
+        component: log-storage
+      annotations:
+        summary: "Log ingestion errors"
+        description: "VictoriaLogs has {{ $value | humanize }} ingestion errors per second"
+        
+  - name: fluentd.rules
+    interval: 30s
+    rules:
+    - alert: FluentdDown
+      expr: up{job="fluentd"} == 0
+      for: 5m
+      labels:
+        severity: warning
+        component: log-collector
+      annotations:
+        summary: "Fluentd is down on node"
+        description: "Fluentd pod on node {{ $labels.instance }} has been down for more than 5 minutes."
+        
+    - alert: FluentdBufferFull
+      expr: fluentd_output_status_buffer_queue_length > 1000
+      for: 10m
+      labels:
+        severity: warning
+        component: log-collector
+      annotations:
+        summary: "Fluentd buffer is filling up"
+        description: "Fluentd buffer queue length is {{ $value }} (threshold: 1000)"
+        
+    - alert: FluentdHighErrorRate
+      expr: rate(fluentd_output_status_num_errors[5m]) > 5
+      for: 5m
+      labels:
+        severity: warning
+        component: log-collector
+      annotations:
+        summary: "Fluentd high error rate"
+        description: "Fluentd has {{ $value | humanize }} errors per second"

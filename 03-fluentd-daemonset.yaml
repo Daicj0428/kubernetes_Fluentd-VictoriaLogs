@@ -1,0 +1,469 @@
+# Fluentd ServiceAccount
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fluentd
+  namespace: kube-logging
+  labels:
+    app: fluentd
+    component: log-collector
+
+---
+# Fluentd ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fluentd
+  labels:
+    app: fluentd
+rules:
+- apiGroups: [""]
+  resources:
+  - pods
+  - pods/logs
+  - namespaces
+  - nodes
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups: ["apps"]
+  resources:
+  - daemonsets
+  - deployments
+  - replicasets
+  - statefulsets
+  verbs:
+  - get
+  - list
+  - watch
+
+---
+# Fluentd ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: fluentd
+  labels:
+    app: fluentd
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: fluentd
+subjects:
+- kind: ServiceAccount
+  name: fluentd
+  namespace: kube-logging
+
+---
+# Fluentd ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluentd-config
+  namespace: kube-logging
+  labels:
+    app: fluentd
+data:
+  fluent.conf: |
+    # Global settings
+    <system>
+      log_level info
+      root_dir /var/log/fluentd-buffer
+      workers 2
+      rpc_endpoint 0.0.0.0:24444
+    </system>
+    
+    # Prometheus metrics
+    <source>
+      @type prometheus
+      bind 0.0.0.0
+      port 24231
+      metrics_path /metrics
+    </source>
+    
+    <source>
+      @type prometheus_output_monitor
+      <labels>
+        hostname ${hostname}
+        namespace ${namespace}
+      </labels>
+    </source>
+    
+    # Container logs input
+    <source>
+      @type tail
+      @id in_tail_container_logs
+      @label @CONTAINER_LOG_PROCESSING
+      path /var/log/containers/*.log
+      pos_file /var/log/fluentd-containers.log.pos
+      tag k8s.container.*
+      read_from_head true
+      refresh_interval 5
+      <parse>
+        @type multi_format
+        <pattern>
+          format json
+          time_key time
+          time_type string
+          time_format "%Y-%m-%dT%H:%M:%S.%NZ"
+          keep_time_key false
+        </pattern>
+        <pattern>
+          format regexp
+          expression /^(?<time>.+) (?<stream>stdout|stderr) [^ ]* (?<log>.*)$/
+          time_format "%Y-%m-%dT%H:%M:%S.%N%:z"
+        </pattern>
+      </parse>
+    </source>
+    
+    # System logs input (optional)
+    <source>
+      @type tail
+      @id in_tail_system_logs
+      @label @SYSTEM_LOG_PROCESSING
+      path /var/log/messages,/var/log/syslog
+      pos_file /var/log/fluentd-system.log.pos
+      tag system.*
+      format syslog
+      read_from_head true
+    </source>
+    
+    # Kubernetes audit logs (if enabled)
+    <source>
+      @type tail
+      @id in_tail_audit_logs
+      @label @AUDIT_LOG_PROCESSING
+      path /var/log/kubernetes/audit*.log
+      pos_file /var/log/fluentd-audit.log.pos
+      tag k8s.audit.*
+      format json
+      read_from_head true
+    </source>
+    
+    # ========== CONTAINER LOG PROCESSING ==========
+    <label @CONTAINER_LOG_PROCESSING>
+      # Detect multi-line exceptions
+      <filter k8s.container.**>
+        @type detect_exceptions
+        remove_tag_prefix k8s
+        message log
+        languages java,python,go,nodejs,ruby,php
+        multiline_flush_interval 0.1
+      </filter>
+      
+      # Parse JSON logs if present
+      <filter container.**>
+        @type parser
+        key_name log
+        reserve_data true
+        remove_key_name_field true
+        <parse>
+          @type json
+          json_parser oj
+        </parse>
+      </filter>
+      
+      # Add Kubernetes metadata
+      <filter container.**>
+        @type kubernetes_metadata
+        @id filter_kube_metadata
+        cache_size 10000
+        skip_labels false
+        skip_container_metadata false
+        skip_master_url true
+        watch false
+        de_dot true
+      </filter>
+      
+      # Transform record for VictoriaLogs
+      <filter container.**>
+        @type record_transformer
+        enable_ruby true
+        auto_typecast true
+        <record>
+          # VictoriaLogs required fields
+          _msg ${record["log"] || record["message"] || ""}
+          _time ${Time.now.utc.iso8601(3)}
+          
+          # VictoriaLogs stream labels (critical for performance!)
+          # These should be low-cardinality, stable identifiers
+          stream_k8s_namespace ${record.dig("kubernetes", "namespace_name") || "default"}
+          stream_k8s_pod ${record.dig("kubernetes", "pod_name") || "unknown"}
+          stream_k8s_container ${record.dig("kubernetes", "container_name") || "unknown"}
+          stream_k8s_node ${record.dig("kubernetes", "host") || "${ENV['NODE_NAME']}"}
+          
+          # Application labels (extract from pod labels)
+          stream_app ${record.dig("kubernetes", "labels", "app") || 
+                     record.dig("kubernetes", "labels", "k8s-app") || 
+                     record.dig("kubernetes", "labels", "name") || 
+                     "unknown"}
+          
+          # Log level detection
+          log_level ${if record["level"]; record["level"]; 
+                     elsif record["severity"]; record["severity"]; 
+                     elsif record["_msg"] =~ /(?i)error|err\b/; "ERROR";
+                     elsif record["_msg"] =~ /(?i)warn|warning\b/; "WARN";
+                     elsif record["_msg"] =~ /(?i)info\b/; "INFO";
+                     elsif record["_msg"] =~ /(?i)debug\b/; "DEBUG";
+                     else "INFO"; end}
+          
+          # Cleanup - remove duplicate fields
+          _original_log ${record["log"]}
+          _original_message ${record["message"]}
+        </record>
+        remove_keys log,message,time,stream
+      </filter>
+      
+      # Buffer and send to VictoriaLogs
+      <match container.**>
+        @type http
+        @id out_victoria_logs
+        
+        # VictoriaLogs ingestion endpoint (http://{service}:9428/insert/jsonline)
+        endpoint http://victoria-logs.kube-logging.svc.cluster.local:9428/insert/jsonline
+        
+        # Format for VictoriaLogs
+        <format>
+          @type json
+        </format>
+        
+        # HTTP settings
+        http_method post
+        content_type application/json
+        open_timeout 5
+        read_timeout 120
+        reload_connections true
+        reconnect_on_error true
+        
+        # Buffer configuration optimized for VictoriaLogs
+        <buffer stream_k8s_namespace,stream_k8s_pod,stream_k8s_container,stream_app,tag>
+          @type file
+          path /var/log/fluentd-buffer/container
+          flush_mode interval
+          flush_interval 5s
+          flush_thread_count 2
+          retry_type exponential_backoff
+          retry_wait 1s
+          retry_max_interval 60s
+          retry_timeout 24h
+          chunk_limit_size 32M
+          total_limit_size 20G
+          queued_chunks_limit_size 2048
+          overflow_action block
+          disable_chunk_backup true
+          compress gzip
+        </buffer>
+        
+        # Authentication (if enabled)
+        # headers:
+        #   Authorization: "Bearer ${VL_AUTH_TOKEN}"
+      </match>
+    </label>
+    
+    # ========== SYSTEM LOG PROCESSING ==========
+    <label @SYSTEM_LOG_PROCESSING>
+      <filter **>
+        @type record_transformer
+        <record>
+          _msg ${record["message"]}
+          _time ${Time.now.utc.iso8601(3)}
+          stream_system_host ${ENV['NODE_NAME']}
+          facility ${record["facility"] || "user"}
+          severity ${record["severity"] || "info"}
+        </record>
+      </filter>
+      
+      <match **>
+        @type http
+        @id out_victoria_system_logs
+        endpoint http://victoria-logs.kube-logging.svc.cluster.local:9428/insert/jsonline
+        http_method post
+        content_type application/json
+        <format>
+          @type json
+        </format>
+        <buffer stream_system_host,tag>
+          @type file
+          path /var/log/fluentd-buffer/system
+          flush_mode interval
+          flush_interval 10s
+          chunk_limit_size 16M
+        </buffer>
+      </match>
+    </label>
+    
+    # ========== AUDIT LOG PROCESSING ==========
+    <label @AUDIT_LOG_PROCESSING>
+      <filter **>
+        @type record_transformer
+        <record>
+          _msg ${record.to_json}
+          _time ${Time.now.utc.iso8601(3)}
+          stream_k8s_audit_source "kubernetes-audit"
+          audit_stage ${record["stage"] || "unknown"}
+          audit_verb ${record["verb"] || "unknown"}
+        </record>
+      </filter>
+      
+      <match **>
+        @type http
+        @id out_victoria_audit_logs
+        endpoint http://victoria-logs.kube-logging.svc.cluster.local:9428/insert/jsonline
+        http_method post
+        content_type application/json
+        <format>
+          @type json
+        </format>
+        <buffer stream_k8s_audit_source,tag>
+          @type file
+          path /var/log/fluentd-buffer/audit
+          flush_mode interval
+          flush_interval 15s
+          chunk_limit_size 16M
+        </buffer>
+      </match>
+    </label>
+
+---
+# Fluentd DaemonSet
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluentd
+  namespace: kube-logging
+  labels:
+    app: fluentd
+    component: log-collector
+    version: v3.1.0
+spec:
+  selector:
+    matchLabels:
+      app: fluentd
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: fluentd
+        component: log-collector
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "24231"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: fluentd
+      tolerations:
+      - key: node-role.kubernetes.io/master
+        effect: NoSchedule
+      - key: node-role.kubernetes.io/control-plane
+        effect: NoSchedule
+      - key: node.kubernetes.io/disk-pressure
+        operator: Exists
+        effect: NoSchedule
+      - key: node.kubernetes.io/memory-pressure
+        operator: Exists
+        effect: NoSchedule
+      - key: node.kubernetes.io/not-ready
+        operator: Exists
+        effect: NoExecute
+      - key: node.kubernetes.io/unreachable
+        operator: Exists
+        effect: NoExecute
+      containers:
+      - name: fluentd
+        image: dai30.test.com/k8s/fluentd:v3.1.0
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: FLUENTD_CONF
+          value: fluent.conf
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        resources:
+          limits:
+            memory: 1Gi
+            cpu: "1"
+          requests:
+            memory: 512Mi
+            cpu: 200m
+        volumeMounts:
+        - name: varlog
+          mountPath: /var/log
+        - name: varlibdockercontainers
+          mountPath: /var/lib/docker/containers
+          readOnly: true
+        - name: varlogkubernetes
+          mountPath: /var/log/kubernetes
+          readOnly: true
+        - name: fluentd-config
+          mountPath: /fluentd/etc
+        - name: fluentd-buffer
+          mountPath: /var/log/fluentd-buffer
+        - name: fluentd-pos
+          mountPath: /var/log/fluentd-pos
+        ports:
+        - containerPort: 24231
+          name: metrics
+          protocol: TCP
+        - containerPort: 24444
+          name: rpc
+          protocol: TCP
+        securityContext:
+          readOnlyRootFilesystem: true
+          runAsUser: 0
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        livenessProbe:
+          httpGet:
+            path: /api/plugins.json
+            port: metrics
+            scheme: HTTP
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /api/plugins.json
+            port: metrics
+            scheme: HTTP
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 5
+      terminationGracePeriodSeconds: 120
+      volumes:
+      - name: varlog
+        hostPath:
+          path: /var/log
+      - name: varlibdockercontainers
+        hostPath:
+          path: /var/lib/docker/containers
+      - name: varlogkubernetes
+        hostPath:
+          path: /var/log/kubernetes
+          type: DirectoryOrCreate
+      - name: fluentd-config
+        configMap:
+          name: fluentd-config
+      - name: fluentd-buffer
+        hostPath:
+          path: /var/lib/fluentd/buffer
+          type: DirectoryOrCreate
+      - name: fluentd-pos
+        hostPath:
+          path: /var/lib/fluentd/pos
+          type: DirectoryOrCreate

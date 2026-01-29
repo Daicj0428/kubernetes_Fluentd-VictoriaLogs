@@ -1,0 +1,69 @@
+# PrometheusRule for PVC/Disk monitoring
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: victoria-logs-storage-alerts
+  namespace: kube-logging
+  labels:
+    app: victoria-logs
+    component: monitoring
+    prometheus: kube-prometheus
+    role: alert-rules
+spec:
+  groups:
+  - name: storage.rules
+    interval: 30s
+    rules:
+    - alert: VictoriaLogsPVCNearFull
+      expr: (kubelet_volume_stats_used_bytes{namespace="kube-logging", persistentvolumeclaim=~"victoria-logs.*"} / kubelet_volume_stats_capacity_bytes{namespace="kube-logging", persistentvolumeclaim=~"victoria-logs.*"}) * 100 > 85
+      for: 10m
+      labels:
+        severity: warning
+        component: log-storage
+      annotations:
+        summary: "PVC nearing capacity"
+        description: "PVC {{ $labels.persistentvolumeclaim }} is {{ $value | humanizePercentage }} full"
+
+    - alert: VictoriaLogsPVCCritical
+      expr: (kubelet_volume_stats_used_bytes{namespace="kube-logging", persistentvolumeclaim=~"victoria-logs.*"} / kubelet_volume_stats_capacity_bytes{namespace="kube-logging", persistentvolumeclaim=~"victoria-logs.*"}) * 100 > 95
+      for: 5m
+      labels:
+        severity: critical
+        component: log-storage
+      annotations:
+        summary: "PVC critically full"
+        description: "PVC {{ $labels.persistentvolumeclaim }} is {{ $value | humanizePercentage }} full, immediate action required"
+
+    - alert: VictoriaLogsSlowDiskIO
+      expr: rate(node_disk_io_time_seconds_total{device=~".*vdc.*"}[5m]) > 0.8
+      for: 15m
+      labels:
+        severity: warning
+        component: log-storage
+      annotations:
+        summary: "High disk I/O wait"
+        description: "Disk {{ $labels.device }} is experiencing high I/O ({{ $value }})"
+
+---
+# PVC auto-expansion monitoring (if supported by storage class)
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: nfs-storage-health
+  namespace: kube-logging
+  labels:
+    component: storage-monitoring
+spec:
+  groups:
+  - name: nfs.storage.rules
+    interval: 60s
+    rules:
+    - alert: NFSClientProvisionerDown
+      expr: up{namespace="kube-system", job="nfs-client-provisioner"} == 0
+      for: 5m
+      labels:
+        severity: critical
+        component: storage
+      annotations:
+        summary: "NFS provisioner is down"
+        description: "NFS client provisioner in kube-system namespace has been down for 5 minutes"
