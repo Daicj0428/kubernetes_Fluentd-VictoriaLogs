@@ -160,8 +160,6 @@ kubectl apply -f 08-pvc-monitoring.yaml
 | `06-network-policy.yaml` | 网络安全策略 | ⚠️ |
 | `07-hpa.yaml` | 自动水平扩容 | ⚠️ |
 | `08-pvc-monitoring.yaml` | 存储监控告警 | ⚠️ |
-| `09-config-fix.yaml` | 配置修复参考 | ❌ |
-| `10-deployment-guide.md` | 详细部署指南 | ❌ |
 
 **说明**:
 - ✅ = 核心组件，必须部署
